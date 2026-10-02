@@ -1,0 +1,1606 @@
+# ============================================================
+# YouTube Video Summarizer + Quiz Generator
+# ============================================================
+# Supports:
+#   - Subtitle download via yt-dlp
+#   - LSA-based summarization (Sumy) with naive fallback
+#   - Keyword extraction + TF-IDF scoring
+#   - Sentiment analysis (TextBlob, optional)
+#   - Text statistics & readability score
+#   - Fill-in-the-blank AND multiple-choice quiz generation
+#   - Markdown & JSON export formats
+#   - Batch processing of multiple URLs
+#   - Streamlit web UI
+#   - SQLite-backed accounts and per-user report history
+#   - Admin dashboard for account status and usage overview
+#   - Full CLI with interactive mode
+# ============================================================
+
+
+# -----------------------------
+# 1) IMPORTS & CONSTANTS
+# -----------------------------
+import os
+import re
+import sys
+import json
+import math
+import time
+import random
+import hashlib
+import tempfile
+import argparse
+import logging
+import textwrap
+from collections import Counter
+from dataclasses import dataclass, asdict, field
+from datetime import datetime
+from typing import Optional, Tuple, List, Dict, Any
+
+import database as db
+
+
+# ---------- Third-party (all wrapped for robustness) ----------
+
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
+try:
+    import nltk
+except ImportError:
+    nltk = None
+
+try:
+    from sumy.parsers.plaintext import PlaintextParser
+    from sumy.nlp.tokenizers import Tokenizer
+    from sumy.summarizers.lsa import LsaSummarizer
+    from sumy.summarizers.luhn import LuhnSummarizer
+    from sumy.summarizers.lex_rank import LexRankSummarizer
+except ImportError:
+    PlaintextParser = Tokenizer = LsaSummarizer = LuhnSummarizer = LexRankSummarizer = None
+
+try:
+    from colorama import init as colorama_init, Fore, Style
+    colorama_init(autoreset=True)       # BUG FIX: moved init call here, inside the try block
+except ImportError:
+    colorama_init = Fore = Style = None  # BUG FIX: colorama_init was missing from the except block
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+try:
+    from textblob import TextBlob
+except ImportError:
+    TextBlob = None
+
+try:
+    import streamlit as st
+except ImportError:
+    st = None
+
+
+# ---------- NLTK resource bootstrap ----------
+
+def _ensure_nltk_resources():
+    """Download required NLTK resources, handling both old and new package names."""
+    if nltk is None:
+        return
+    # BUG FIX: newer NLTK (3.8+) uses 'punkt_tab' instead of 'punkt'.
+    # Attempting both ensures compatibility across versions.
+    for resource in ('tokenizers/punkt', 'tokenizers/punkt_tab'):
+        try:
+            nltk.data.find(resource)
+        except LookupError:
+            pkg = resource.split('/')[-1]
+            try:
+                nltk.download(pkg, quiet=True)
+            except Exception:
+                pass  # Offline environment — will fail gracefully later
+
+_ensure_nltk_resources()
+
+
+# ---------- Logger ----------
+
+logger = logging.getLogger("yt_summarizer")
+logger.setLevel(logging.DEBUG)
+_ch = logging.StreamHandler()           # BUG FIX: renamed from 'ch' → '_ch' to avoid
+_ch.setLevel(logging.INFO)              # shadowing the name used as a generator variable
+_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+_ch.setFormatter(_formatter)
+if not logger.handlers:
+    logger.addHandler(_ch)
+
+
+# ---------- Constants ----------
+
+BASE_SUB_NAME       = 'temp_sub'
+ALLOWED_VIDEO_DOMAINS = ("youtube.com", "youtu.be")
+DEFAULT_SENTENCES   = 8
+DEFAULT_QUIZ_QS     = 5
+DEFAULT_KEYWORDS    = 10
+CACHE_DIR           = os.path.join(tempfile.gettempdir(), "yt_summarizer_cache")
+
+STOPWORDS: set = {
+    "the", "and", "to", "of", "a", "an", "in", "is", "that", "it", "for",
+    "on", "with", "as", "this", "are", "be", "i", "you", "he", "she", "we",
+    "they", "but", "not", "at", "by", "from", "or", "was", "were", "have",
+    "has", "had", "do", "does", "did", "will", "would", "could", "should",
+    "may", "might", "shall", "can", "its", "their", "our", "your", "his",
+    "her", "my", "me", "him", "us", "them", "what", "which", "who", "when",
+    "where", "how", "so", "if", "then", "than", "just", "also", "more",
+    "about", "into", "up", "out", "there", "here", "been", "being", "very",
+    "all", "some", "one", "like", "get", "got", "go", "going", "said",
+    "now", "even", "only", "after", "before", "over", "between", "through",
+    "each", "any", "these", "those", "such", "because", "while", "although",
+    "however", "therefore", "thus", "hence", "both", "either", "neither",
+    "yet", "still", "already", "again", "back", "way", "make", "know",
+    "think", "see", "look", "want", "come", "say", "tell", "use", "need",
+    "well", "much", "many", "most", "other", "new", "first", "last", "good",
+    "high", "own", "same", "right", "big", "great", "little", "old", "long",
+    "down", "never", "really", "something", "everything", "nothing", "anything",
+}
+
+
+# -----------------------------
+# 2) DATA STRUCTURES
+# -----------------------------
+
+@dataclass
+class VideoReport:
+    """Container for all analysis results of a single video."""
+    title:        str
+    url:          str
+    timestamp:    str  = field(default_factory=lambda: datetime.now().isoformat(timespec='seconds'))
+    summary:      str  = ""
+    keywords:     List[Tuple[str, int]]  = field(default_factory=list)
+    stats:        Dict[str, Any]         = field(default_factory=dict)
+    sentiment:    Dict[str, float]       = field(default_factory=dict)
+    quiz_fitb:    List[Dict[str, str]]   = field(default_factory=list)  # fill-in-the-blank
+    quiz_mc:      List[Dict[str, Any]]   = field(default_factory=list)  # multiple-choice
+    readability:  Dict[str, float]       = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+
+
+# -----------------------------
+# 3) UTILITIES
+# -----------------------------
+
+def safe_write(path: str, content: str) -> None:
+    """Atomically write content to a file using a temp-file swap."""
+    dirname = os.path.dirname(path) or '.'
+    os.makedirs(dirname, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=dirname, prefix="tmp_write_", text=True)
+    os.close(fd)
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def print_status(msg: str, color: Optional[str] = None) -> None:
+    """Print a status line with optional ANSI color for CLI mode."""
+    if Fore and Style and color:
+        print(getattr(Fore, color.upper(), '') + msg + Style.RESET_ALL)
+    else:
+        print(msg)
+
+
+def is_valid_youtube_url(url: str) -> bool:
+    """Return True if the string is a valid, supported YouTube URL."""
+    if not url or not isinstance(url, str):
+        return False
+    url = url.strip()
+    if not url.startswith(('http://', 'https://')):
+        return False
+    return any(domain in url for domain in ALLOWED_VIDEO_DOMAINS)
+
+
+def _url_cache_key(url: str) -> str:
+    """Generate a short, filesystem-safe cache key for a URL."""
+    return hashlib.md5(url.encode()).hexdigest()[:12]
+
+
+def validate_dependencies(require_summarizer: bool = True) -> List[str]:
+    """
+    Check whether the required third-party packages are installed.
+    Returns a list of human-readable error messages; empty list means OK.
+    """
+    missing: List[str] = []
+    if yt_dlp is None:
+        missing.append("yt-dlp  →  pip install yt-dlp")
+    if nltk is None:
+        missing.append("nltk    →  pip install nltk")
+    if require_summarizer and PlaintextParser is None:
+        missing.append("sumy    →  pip install sumy")
+    return missing
+
+
+def wrap_text(text: str, width: int = 90) -> str:
+    """Word-wrap a block of text for nicer terminal output."""
+    return '\n'.join(
+        textwrap.fill(line, width=width) if line.strip() else ''
+        for line in text.splitlines()
+    )
+
+
+# -----------------------------
+# 4) SUBTITLE DOWNLOAD
+# -----------------------------
+
+def download_subtitles(
+    url: str,
+    output_dir: str,
+    languages: List[str] = None,
+    use_cache: bool = True,
+) -> Tuple[str, Optional[str]]:
+    """
+    Download subtitles for a YouTube video using yt-dlp.
+
+    Args:
+        url:         YouTube video URL.
+        output_dir:  Directory to store downloaded subtitle files.
+        languages:   Preferred subtitle language codes (default: ['en']).
+        use_cache:   If True, reuse a previously downloaded subtitle file.
+
+    Returns:
+        (video_title, path_to_vtt_file_or_None)
+    """
+    if yt_dlp is None:
+        raise ModuleNotFoundError(
+            "yt_dlp is not installed. Run: pip install yt-dlp"
+        )
+
+    if languages is None:
+        languages = ['en']
+
+    # --- Cache check ---
+    if use_cache:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        cache_key   = _url_cache_key(url)
+        cache_meta  = os.path.join(CACHE_DIR, f"{cache_key}.json")
+        if os.path.exists(cache_meta):
+            try:
+                with open(cache_meta, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                cached_vtt = meta.get('vtt_path')
+                if cached_vtt and os.path.exists(cached_vtt):
+                    logger.info("Cache hit for %s", url)
+                    return meta['title'], cached_vtt
+            except (json.JSONDecodeError, KeyError):
+                pass  # Corrupted cache — re-download
+
+    outtmpl = os.path.join(output_dir, BASE_SUB_NAME + '.%(ext)s')
+    ydl_opts = {
+        'writesubtitles':    True,
+        'writeautomaticsub': True,
+        'subtitleslangs':    languages,
+        'skip_download':     True,
+        'quiet':             True,
+        'no_warnings':       True,
+        'outtmpl':           outtmpl,
+    }
+
+    print_status("⏬  Downloading subtitles…", color='green')
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError as exc:
+            raise RuntimeError(
+                f"Failed to download subtitle info. Check the URL.\n  Original: {exc}"
+            ) from exc
+
+    title = info.get('title', 'Untitled Video')
+
+    # Locate the downloaded .vtt file
+    candidate_paths: List[str] = [
+        os.path.join(output_dir, f"{BASE_SUB_NAME}.{lang}.vtt")
+        for lang in languages
+    ]
+    candidate_paths.append(os.path.join(output_dir, f"{BASE_SUB_NAME}.vtt"))
+
+    vtt_path: Optional[str] = None
+    for path in candidate_paths:
+        if os.path.exists(path):
+            vtt_path = path
+            break
+
+    if vtt_path is None:
+        # Fallback: scan directory for any matching .vtt
+        for fname in os.listdir(output_dir):
+            if fname.startswith(BASE_SUB_NAME) and fname.endswith('.vtt'):
+                vtt_path = os.path.join(output_dir, fname)
+                break
+
+    # --- Write cache entry ---
+    if use_cache and vtt_path:
+        try:
+            with open(cache_meta, 'w', encoding='utf-8') as f:
+                json.dump({'title': title, 'vtt_path': vtt_path, 'url': url}, f)
+        except Exception as exc:
+            logger.warning("Could not write cache: %s", exc)
+
+    return title, vtt_path
+
+
+# -----------------------------
+# 5) VTT PARSING & CLEANING
+# -----------------------------
+
+# Compiled regex patterns for performance
+_RE_VTT_TAG      = re.compile(r'<[^>]+>')
+_RE_CUES         = re.compile(r'\([^)]*\)')
+_RE_SPEAKER      = re.compile(r'^[A-Za-z0-9_\- ]+:')
+_RE_TIMESTAMP    = re.compile(r'^[0-9]{2}:[0-9]{2}:[0-9]{2}[\.,][0-9]{3}')
+_RE_DIGIT_LINE   = re.compile(r'^\d+$')
+_RE_WHITESPACE   = re.compile(r'\s+')
+_RE_MUSIC        = re.compile(r'\[.*?\]|\*.*?\*')  # [Music], *applause*, etc.
+
+
+def vtt_to_text(vtt_file: str) -> str:
+    """
+    Parse a WebVTT (.vtt) subtitle file into clean, deduplicated plain text.
+
+    Removes:
+      - WEBVTT headers and metadata lines
+      - Timestamp cue lines
+      - VTT inline tags (<c>, <i>, <b>, etc.)
+      - Sound descriptors like (music), [applause], *laughter*
+      - Speaker labels ("HOST:", "NARRATOR:")
+      - Duplicate adjacent lines (common in auto-generated subtitles)
+    """
+    if not os.path.exists(vtt_file):
+        raise FileNotFoundError(f"Subtitle file not found: {vtt_file}")
+
+    lines:      List[str] = []
+    prev_line:  str       = ""
+
+    with open(vtt_file, 'r', encoding='utf-8', errors='replace') as f:
+        for raw in f:
+            line = raw.strip()
+
+            # Skip blank / header / timestamp / numeric-index lines
+            if not line:
+                continue
+            if '-->' in line:
+                continue
+            if line.startswith(('WEBVTT', 'Kind:', 'Language:', 'NOTE', 'STYLE', 'REGION')):
+                continue
+            if _RE_DIGIT_LINE.fullmatch(line):
+                continue
+            if _RE_TIMESTAMP.match(line):
+                continue
+
+            # Remove inline markup
+            line = _RE_VTT_TAG.sub('', line)
+            line = _RE_MUSIC.sub('', line)
+            line = _RE_CUES.sub('', line)
+            line = _RE_SPEAKER.sub('', line).strip()
+
+            if not line:
+                continue
+
+            # Deduplicate adjacent identical/substring lines (auto-caption artefact)
+            if line == prev_line or line in prev_line:
+                continue
+
+            lines.append(line)
+            prev_line = line
+
+    text = ' '.join(lines)
+    text = _RE_WHITESPACE.sub(' ', text).strip()
+    return text
+
+
+def clean_text_for_summary(text: str) -> str:
+    """
+    Normalize text before summarization:
+      - Replace common Unicode punctuation with ASCII equivalents
+      - Remove non-printable characters
+      - Collapse whitespace
+      - Strip leading/trailing spaces
+    """
+    replacements = {
+        '\u2019': "'",  '\u2018': "'",
+        '\u201c': '"',  '\u201d': '"',
+        '\u2013': '-',  '\u2014': '--',
+        '\u2026': '...',
+        '\u00a0': ' ',  # non-breaking space
+    }
+    for uni_char, ascii_char in replacements.items():
+        text = text.replace(uni_char, ascii_char)
+
+    # BUG FIX: renamed generator variable from 'ch' (which shadows the module-level
+    # logging handler '_ch') to 'char' for clarity and correctness.
+    text = ''.join(char for char in text if char.isprintable())
+    text = _RE_WHITESPACE.sub(' ', text)
+    return text.strip()
+
+
+def split_into_chunks(text: str, max_words: int = 1000) -> List[str]:
+    """
+    Split a long text into overlapping sentence-level chunks for processing.
+    Useful for very long videos that exceed summarizer limits.
+    """
+    if nltk is None:
+        # Naive split by punctuation
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+    else:
+        sentences = nltk.sent_tokenize(text)
+
+    chunks:   List[str] = []
+    current:  List[str] = []
+    count:    int       = 0
+
+    for sent in sentences:
+        word_count = len(sent.split())
+        if count + word_count > max_words and current:
+            chunks.append(' '.join(current))
+            # Overlap: keep last 2 sentences for context continuity
+            current = current[-2:]
+            count   = sum(len(s.split()) for s in current)
+        current.append(sent)
+        count += word_count
+
+    if current:
+        chunks.append(' '.join(current))
+
+    return chunks
+
+
+# -----------------------------
+# 6) SUMMARIZATION
+# -----------------------------
+
+SUMMARIZER_BACKENDS = ('lsa', 'luhn', 'lexrank', 'naive')
+
+
+def summarize_text(
+    text:           str,
+    sentence_count: int = DEFAULT_SENTENCES,
+    backend:        str = 'lsa',
+) -> str:
+    """
+    Summarize text using the chosen backend.
+
+    Args:
+        text:           Input text to summarize.
+        sentence_count: Target number of output sentences.
+        backend:        One of 'lsa', 'luhn', 'lexrank', 'naive'.
+
+    Returns:
+        Multi-sentence summary string.
+    """
+    if not text or not text.strip():
+        return ""
+
+    backend = backend.lower()
+
+    if backend == 'lsa':
+        return _summarize_lsa(text, sentence_count)
+    elif backend == 'luhn':
+        return _summarize_luhn(text, sentence_count)
+    elif backend == 'lexrank':
+        return _summarize_lexrank(text, sentence_count)
+    else:
+        return _summarize_naive(text, sentence_count)
+
+
+def _summarize_lsa(text: str, sentence_count: int) -> str:
+    """Latent Semantic Analysis summarizer (Sumy)."""
+    if not all([PlaintextParser, Tokenizer, LsaSummarizer, nltk]):
+        logger.warning("LSA dependencies not available; falling back to naive.")
+        return _summarize_naive(text, sentence_count)
+
+    parser     = PlaintextParser.from_string(text, Tokenizer("english"))
+    summarizer = LsaSummarizer()
+    try:
+        result = summarizer(parser.document, sentence_count)
+        return '\n'.join(str(s) for s in result)
+    except Exception as exc:
+        logger.warning("LSA summarizer failed (%s); falling back to naive.", exc)
+        return _summarize_naive(text, sentence_count)
+
+
+def _summarize_luhn(text: str, sentence_count: int) -> str:
+    """Luhn frequency-based summarizer (Sumy)."""
+    if not all([PlaintextParser, Tokenizer, LuhnSummarizer, nltk]):
+        logger.warning("Luhn dependencies not available; falling back to LSA.")
+        return _summarize_lsa(text, sentence_count)
+
+    parser     = PlaintextParser.from_string(text, Tokenizer("english"))
+    summarizer = LuhnSummarizer()
+    try:
+        result = summarizer(parser.document, sentence_count)
+        return '\n'.join(str(s) for s in result)
+    except Exception as exc:
+        logger.warning("Luhn summarizer failed (%s); falling back to naive.", exc)
+        return _summarize_naive(text, sentence_count)
+
+
+def _summarize_lexrank(text: str, sentence_count: int) -> str:
+    """LexRank graph-based summarizer (Sumy)."""
+    if not all([PlaintextParser, Tokenizer, LexRankSummarizer, nltk]):
+        logger.warning("LexRank dependencies not available; falling back to LSA.")
+        return _summarize_lsa(text, sentence_count)
+
+    parser     = PlaintextParser.from_string(text, Tokenizer("english"))
+    summarizer = LexRankSummarizer()
+    try:
+        result = summarizer(parser.document, sentence_count)
+        return '\n'.join(str(s) for s in result)
+    except Exception as exc:
+        logger.warning("LexRank summarizer failed (%s); falling back to naive.", exc)
+        return _summarize_naive(text, sentence_count)
+
+
+def _summarize_naive(text: str, sentence_count: int = DEFAULT_SENTENCES) -> str:
+    """
+    Pure-Python fallback summarizer based on normalized term frequency.
+    Works even without NLTK or Sumy installed.
+
+    Algorithm:
+      1. Tokenize into sentences (regex-based if NLTK unavailable).
+      2. Score each sentence by the sum of its word frequencies, normalized
+         by √(sentence_length) to avoid bias toward long sentences.
+      3. Return the top N sentences in their original order.
+    """
+    if nltk:
+        sentences = nltk.sent_tokenize(text)
+    else:
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    if not sentences:
+        return text[:500]
+
+    words = re.findall(r"\w+", text.lower())
+    freq  = Counter(w for w in words if w not in STOPWORDS)
+
+    scored: List[Tuple[float, str]] = []
+    for sent in sentences:
+        sent_words = re.findall(r"\w+", sent.lower())
+        if not sent_words:
+            continue
+        score = sum(freq.get(w, 0) for w in sent_words) / (len(sent_words) ** 0.5)
+        scored.append((score, sent))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_sents = [s for _, s in scored[:max(1, sentence_count)]]
+    # Restore original document order
+    ordered = sorted(top_sents, key=lambda s: sentences.index(s))
+    return '\n'.join(s.strip() for s in ordered)
+
+
+def summarize_long_text(
+    text:           str,
+    sentence_count: int = DEFAULT_SENTENCES,
+    backend:        str = 'lsa',
+    chunk_words:    int = 1000,
+) -> str:
+    """
+    Handle very long transcripts by splitting into chunks, summarizing each,
+    then summarizing the combined intermediate summaries (map-reduce style).
+    """
+    chunks = split_into_chunks(text, max_words=chunk_words)
+    if len(chunks) <= 1:
+        return summarize_text(text, sentence_count, backend)
+
+    logger.info("Long text detected (%d chunks). Using map-reduce summarization.", len(chunks))
+    per_chunk = max(2, sentence_count // len(chunks) + 1)
+
+    intermediate_summaries: List[str] = []
+    for i, chunk in enumerate(chunks):
+        logger.debug("Summarizing chunk %d / %d…", i + 1, len(chunks))
+        intermediate_summaries.append(summarize_text(chunk, per_chunk, backend))
+
+    combined = ' '.join(intermediate_summaries)
+    return summarize_text(combined, sentence_count, backend)
+
+
+# -----------------------------
+# 7) KEYWORDS & TF-IDF
+# -----------------------------
+
+def extract_keywords(text: str, top_n: int = DEFAULT_KEYWORDS) -> List[Tuple[str, int]]:
+    """
+    Extract the most frequent meaningful keywords from the text.
+    Filters out single-character tokens and common English stopwords.
+
+    Returns:
+        List of (word, frequency) tuples sorted by frequency descending.
+    """
+    words    = re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
+    filtered = [w for w in words if w not in STOPWORDS]
+    return Counter(filtered).most_common(top_n)
+
+
+def extract_tfidf_keywords(text: str, top_n: int = DEFAULT_KEYWORDS) -> List[Tuple[str, float]]:
+    """
+    TF-IDF–style keyword scoring within a single document.
+    Uses sentence-level IDF: words appearing in few sentences get a higher score.
+
+    Returns:
+        List of (word, tfidf_score) tuples sorted by score descending.
+    """
+    if nltk:
+        sentences = nltk.sent_tokenize(text)
+    else:
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    num_sentences = max(len(sentences), 1)
+    words         = re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
+    tf            = Counter(w for w in words if w not in STOPWORDS)
+    total_words   = max(sum(tf.values()), 1)
+
+    # Document frequency across sentences
+    df: Dict[str, int] = Counter()
+    for sent in sentences:
+        unique_in_sent = set(re.findall(r"\b[a-zA-Z]{3,}\b", sent.lower()))
+        for word in unique_in_sent:
+            if word not in STOPWORDS:
+                df[word] += 1
+
+    scores: Dict[str, float] = {}
+    for word, count in tf.items():
+        tf_score  = count / total_words
+        idf_score = math.log((num_sentences + 1) / (df.get(word, 0) + 1)) + 1
+        scores[word] = tf_score * idf_score
+
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return sorted_scores[:top_n]
+
+
+# -----------------------------
+# 8) TEXT STATISTICS & READABILITY
+# -----------------------------
+
+def _count_syllables(word: str) -> int:
+    """Approximate syllable count for a single English word."""
+    word = word.lower().strip(".,;:!?'\"")
+    if not word:
+        return 0
+    vowels  = "aeiouy"
+    count   = 0
+    prev_v  = False
+    for char in word:
+        is_v = char in vowels
+        if is_v and not prev_v:
+            count += 1
+        prev_v = is_v
+    if word.endswith('e') and count > 1:
+        count -= 1
+    return max(1, count)
+
+
+def text_statistics(text: str) -> Dict[str, Any]:
+    """
+    Compute a comprehensive set of text statistics.
+
+    Returns a dict with:
+      - sentences, words, unique_words, characters
+      - avg_word_length, avg_sentence_length
+      - lexical_diversity (unique_words / words)
+    """
+    # BUG FIX: original crashed with AttributeError when nltk was None.
+    # Now uses a regex fallback for sentence tokenization.
+    if nltk:
+        try:
+            sentences = nltk.sent_tokenize(text)
+        except Exception:
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+    else:
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    words       = re.findall(r"\b\w+\b", text)
+    chars       = len(text)
+    num_sents   = max(len([s for s in sentences if s.strip()]), 1)
+    num_words   = max(len(words), 1)
+    unique_wds  = set(w.lower() for w in words)
+
+    avg_word_len  = sum(len(w) for w in words) / num_words
+    avg_sent_len  = num_words / num_sents
+    lex_diversity = len(unique_wds) / num_words
+
+    return {
+        'sentences':          num_sents,
+        'words':              num_words,
+        'unique_words':       len(unique_wds),
+        'characters':         chars,
+        'avg_word_length':    round(avg_word_len, 2),
+        'avg_sentence_length': round(avg_sent_len, 2),
+        'lexical_diversity':  round(lex_diversity, 4),
+    }
+
+
+def flesch_kincaid_readability(text: str) -> Dict[str, float]:
+    """
+    Compute Flesch Reading Ease and Flesch-Kincaid Grade Level.
+
+    Flesch Reading Ease: 0–100 scale (higher = easier).
+    FK Grade Level: US school grade equivalent.
+    """
+    if nltk:
+        try:
+            sentences = nltk.sent_tokenize(text)
+        except Exception:
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+    else:
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    words     = re.findall(r"\b\w+\b", text)
+    syllables = sum(_count_syllables(w) for w in words)
+
+    num_words = max(len(words), 1)
+    num_sents = max(len(sentences), 1)
+    num_syll  = max(syllables, 1)
+
+    asl = num_words / num_sents     # average sentence length
+    asw = num_syll  / num_words     # average syllables per word
+
+    flesch_ease  = 206.835 - 1.015 * asl - 84.6 * asw
+    fk_grade     = 0.39 * asl + 11.8 * asw - 15.59
+
+    return {
+        'flesch_reading_ease': round(max(0.0, min(100.0, flesch_ease)), 2),
+        'fk_grade_level':      round(max(0.0, fk_grade), 2),
+    }
+
+
+# -----------------------------
+# 9) SENTIMENT ANALYSIS
+# -----------------------------
+
+def analyze_sentiment(text: str) -> Dict[str, float]:
+    """
+    Perform sentiment analysis on the text using TextBlob.
+
+    Returns:
+        {'polarity': float [-1, 1], 'subjectivity': float [0, 1]}
+        or empty dict if TextBlob is not installed.
+    """
+    if TextBlob is None:
+        return {}
+    try:
+        blob = TextBlob(text)
+        return {
+            'polarity':    round(blob.sentiment.polarity,    4),
+            'subjectivity': round(blob.sentiment.subjectivity, 4),
+        }
+    except Exception as exc:
+        logger.warning("Sentiment analysis failed: %s", exc)
+        return {}
+
+
+def sentiment_label(polarity: float) -> str:
+    """Convert a polarity score to a human-readable label."""
+    if polarity >  0.3:  return "Positive 😊"
+    if polarity < -0.3:  return "Negative 😟"
+    if polarity >  0.1:  return "Slightly Positive"
+    if polarity < -0.1:  return "Slightly Negative"
+    return "Neutral 😐"
+
+
+# -----------------------------
+# 10) QUIZ GENERATION
+# -----------------------------
+
+def generate_fitb_quiz(
+    summary_text:   str,
+    num_questions:  int = DEFAULT_QUIZ_QS,
+) -> List[Dict[str, str]]:
+    """
+    Generate Fill-In-The-Blank (FITB) quiz questions from the summary.
+
+    Each question blanks out one content word (4–12 letters) from a sentence.
+
+    Returns:
+        List of {'question': str, 'answer': str} dicts.
+    """
+    if not summary_text or not summary_text.strip():
+        return []
+
+    if nltk:
+        try:
+            sentences = nltk.sent_tokenize(summary_text)
+        except Exception:
+            sentences = re.split(r'(?<=[.!?])\s+', summary_text)
+    else:
+        sentences = re.split(r'(?<=[.!?])\s+', summary_text)
+
+    candidates = [s.strip() for s in sentences if len(s.split()) >= 7]
+    random.shuffle(candidates)
+    quiz: List[Dict[str, str]] = []
+
+    for sent in candidates[:num_questions]:
+        words   = sent.split()
+        indices = [
+            i for i, w in enumerate(words)
+            if w.isalpha() and 4 <= len(w) <= 12 and w.lower() not in STOPWORDS
+        ]
+        if not indices:
+            continue
+        blank_idx    = random.choice(indices)
+        answer       = words[blank_idx].strip('.,;:!?"\'')
+        words[blank_idx] = '_____'
+        question     = ' '.join(words)
+        quiz.append({
+            'question': f"Q{len(quiz) + 1}. {question}",
+            'answer':   answer,
+        })
+
+    return quiz
+
+
+def generate_mc_quiz(
+    summary_text:   str,
+    num_questions:  int = DEFAULT_QUIZ_QS,
+    num_choices:    int = 4,
+) -> List[Dict[str, Any]]:
+    """
+    Generate Multiple-Choice (MC) quiz questions from the summary.
+
+    Distractors are randomly sampled from other content words in the text.
+
+    Returns:
+        List of dicts with keys: 'question', 'options' (list), 'answer' (str).
+    """
+    if not summary_text or not summary_text.strip():
+        return []
+
+    if nltk:
+        try:
+            sentences = nltk.sent_tokenize(summary_text)
+        except Exception:
+            sentences = re.split(r'(?<=[.!?])\s+', summary_text)
+    else:
+        sentences = re.split(r'(?<=[.!?])\s+', summary_text)
+
+    all_words = [
+        w.strip('.,;:!?"\'').lower()
+        for w in re.findall(r"\b[a-zA-Z]{4,12}\b", summary_text)
+        if w.lower() not in STOPWORDS
+    ]
+    word_pool = list(set(all_words))
+
+    candidates = [s.strip() for s in sentences if len(s.split()) >= 7]
+    random.shuffle(candidates)
+    quiz: List[Dict[str, Any]] = []
+
+    for sent in candidates[:num_questions]:
+        words   = sent.split()
+        indices = [
+            i for i, w in enumerate(words)
+            if re.match(r'^[a-zA-Z]{4,12}$', w) and w.lower() not in STOPWORDS
+        ]
+        if not indices:
+            continue
+
+        blank_idx    = random.choice(indices)
+        answer       = words[blank_idx].strip('.,;:!?"\'').lower()
+        words[blank_idx] = '_____'
+        question     = ' '.join(words)
+
+        # Build distractors: other content words, excluding the correct answer
+        distractors = [w for w in word_pool if w != answer]
+        if len(distractors) < num_choices - 1:
+            continue  # Not enough distractors — skip this question
+
+        chosen_distractors = random.sample(distractors, num_choices - 1)
+        options = chosen_distractors + [answer]
+        random.shuffle(options)
+        options = [f"({chr(65 + i)}) {opt}" for i, opt in enumerate(options)]
+        correct_letter = chr(65 + [opt.split(') ')[1] for opt in options].index(answer))
+
+        quiz.append({
+            'question': f"Q{len(quiz) + 1}. {question}",
+            'options':  options,
+            'answer':   f"({correct_letter}) {answer}",
+        })
+
+    return quiz
+
+
+# -----------------------------
+# 11) OUTPUT FORMATTING
+# -----------------------------
+
+def format_text_output(report: VideoReport) -> str:
+    """Format a VideoReport as a human-readable plain-text report."""
+    SEP  = "=" * 60
+    sep2 = "-" * 60
+
+    parts = [
+        SEP,
+        "🎬  VIDEO SUMMARY REPORT",
+        SEP,
+        f"Title     : {report.title}",
+        f"URL       : {report.url}",
+        f"Generated : {report.timestamp}",
+        SEP,
+        "",
+        "📘  SUMMARY",
+        sep2,
+        wrap_text(report.summary) if report.summary else "Could not generate summary.",
+        "",
+        "🔎  KEYWORDS (frequency)",
+        sep2,
+    ]
+
+    if report.keywords:
+        kw_line = ', '.join(f"{k} ({v})" for k, v in report.keywords)
+        parts.append(wrap_text(kw_line))
+    else:
+        parts.append("None extracted.")
+
+    parts += ["", "📊  STATISTICS", sep2]
+    for k, v in report.stats.items():
+        label = k.replace('_', ' ').title()
+        parts.append(f"  {label}: {v}")
+
+    if report.readability:
+        parts += ["", "📖  READABILITY", sep2]
+        for k, v in report.readability.items():
+            label = k.replace('_', ' ').title()
+            parts.append(f"  {label}: {v}")
+
+    if report.sentiment:
+        pol   = report.sentiment.get('polarity', 0)
+        subj  = report.sentiment.get('subjectivity', 0)
+        parts += [
+            "", "💬  SENTIMENT", sep2,
+            f"  Polarity:      {pol:+.4f}  →  {sentiment_label(pol)}",
+            f"  Subjectivity:  {subj:.4f}  (0 = objective, 1 = subjective)",
+        ]
+
+    parts += ["", "🧠  FILL-IN-THE-BLANK QUIZ", sep2]
+    if report.quiz_fitb:
+        for q in report.quiz_fitb:
+            parts.append(q['question'])
+            parts.append(f"   ✅ Answer: {q['answer']}\n")
+    else:
+        parts.append("No FITB questions generated.")
+
+    parts += ["", "🎯  MULTIPLE-CHOICE QUIZ", sep2]
+    if report.quiz_mc:
+        for q in report.quiz_mc:
+            parts.append(q['question'])
+            for opt in q['options']:
+                parts.append(f"   {opt}")
+            parts.append(f"   ✅ Answer: {q['answer']}\n")
+    else:
+        parts.append("No MC questions generated.")
+
+    parts.append(SEP)
+    return '\n'.join(parts)
+
+
+def format_markdown_output(report: VideoReport) -> str:
+    """Format a VideoReport as a Markdown document."""
+    lines = [
+        f"# 🎬 Video Summary: {report.title}",
+        "",
+        f"**URL:** {report.url}  ",
+        f"**Generated:** {report.timestamp}",
+        "",
+        "---",
+        "",
+        "## 📘 Summary",
+        "",
+        report.summary or "*Could not generate summary.*",
+        "",
+        "---",
+        "",
+        "## 🔎 Keywords",
+        "",
+    ]
+
+    if report.keywords:
+        lines.append("| Keyword | Frequency |")
+        lines.append("|---------|-----------|")
+        for word, freq in report.keywords:
+            lines.append(f"| {word} | {freq} |")
+    else:
+        lines.append("*None extracted.*")
+
+    lines += ["", "---", "", "## 📊 Statistics", ""]
+    lines.append("| Metric | Value |")
+    lines.append("|--------|-------|")
+    for k, v in report.stats.items():
+        lines.append(f"| {k.replace('_', ' ').title()} | {v} |")
+
+    if report.readability:
+        lines += ["", "### 📖 Readability", ""]
+        lines.append("| Metric | Value |")
+        lines.append("|--------|-------|")
+        for k, v in report.readability.items():
+            lines.append(f"| {k.replace('_', ' ').title()} | {v} |")
+
+    if report.sentiment:
+        pol  = report.sentiment.get('polarity', 0)
+        subj = report.sentiment.get('subjectivity', 0)
+        lines += [
+            "", "---", "", "## 💬 Sentiment", "",
+            f"- **Polarity:** {pol:+.4f} → {sentiment_label(pol)}",
+            f"- **Subjectivity:** {subj:.4f}",
+        ]
+
+    lines += ["", "---", "", "## 🧠 Fill-In-The-Blank Quiz", ""]
+    if report.quiz_fitb:
+        for q in report.quiz_fitb:
+            lines.append(f"**{q['question']}**")
+            lines.append(f"> ✅ **Answer:** {q['answer']}")
+            lines.append("")
+    else:
+        lines.append("*No questions generated.*")
+
+    lines += ["---", "", "## 🎯 Multiple-Choice Quiz", ""]
+    if report.quiz_mc:
+        for q in report.quiz_mc:
+            lines.append(f"**{q['question']}**")
+            for opt in q['options']:
+                lines.append(f"- {opt}")
+            lines.append(f"> ✅ **Answer:** {q['answer']}")
+            lines.append("")
+    else:
+        lines.append("*No questions generated.*")
+
+    return '\n'.join(lines)
+
+
+# --------------------------------------------------------------------------
+# 12) CORE PIPELINE
+# --------------------------------------------------------------------------
+
+def build_report(
+    url:            str,
+    sentence_count: int  = DEFAULT_SENTENCES,
+    quiz_qs:        int  = DEFAULT_QUIZ_QS,
+    top_keywords:   int  = DEFAULT_KEYWORDS,
+    backend:        str  = 'lsa',
+    use_cache:      bool = True,
+) -> VideoReport:
+    """
+    Full analysis pipeline for a single YouTube URL.
+
+    Steps:
+      1. Validate URL
+      2. Download subtitles
+      3. Parse VTT → plain text
+      4. Clean text
+      5. Summarize (chunked for long videos)
+      6. Extract keywords (raw frequency + TF-IDF)
+      7. Compute statistics & readability
+      8. Sentiment analysis (if TextBlob available)
+      9. Generate FITB and MC quizzes
+     10. Package everything into a VideoReport
+
+    Returns:
+        A fully populated VideoReport dataclass.
+    """
+    errors = validate_dependencies(require_summarizer=(backend != 'naive'))
+    if errors:
+        raise ModuleNotFoundError(
+            "Missing required packages:\n" + "\n".join(f"  • {e}" for e in errors)
+        )
+
+    if not is_valid_youtube_url(url):
+        raise ValueError(f"Invalid YouTube URL: '{url}'")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # 1. Download
+        title, sub_file = download_subtitles(url, temp_dir, use_cache=use_cache)
+
+        if not sub_file:
+            raise RuntimeError(
+                "No subtitles found. The video may not have English subtitles "
+                "(auto-generated or manual)."
+            )
+
+        # 2. Parse
+        raw_text = vtt_to_text(sub_file)
+        if not raw_text.strip():
+            raise RuntimeError("Subtitle file was empty or could not be parsed.")
+
+        # 3. Clean
+        cleaned = clean_text_for_summary(raw_text)
+
+    # 4. Summarize
+    print_status("✍️  Summarizing…", color='cyan')
+    summary = summarize_long_text(cleaned, sentence_count, backend)
+
+    # 5. Keywords
+    keywords    = extract_keywords(cleaned, top_n=top_keywords)
+    tfidf_kws   = extract_tfidf_keywords(cleaned, top_n=top_keywords)
+
+    # 6. Stats & readability
+    stats       = text_statistics(cleaned)
+    readability = flesch_kincaid_readability(cleaned)
+
+    # 7. Sentiment
+    sentiment = analyze_sentiment(cleaned)
+
+    # 8. Quizzes
+    print_status("🧩  Generating quiz questions…", color='yellow')
+    quiz_fitb = generate_fitb_quiz(summary, num_questions=quiz_qs)
+    quiz_mc   = generate_mc_quiz(summary, num_questions=quiz_qs)
+
+    return VideoReport(
+        title       = title,
+        url         = url,
+        summary     = summary,
+        keywords    = keywords,
+        stats       = stats,
+        sentiment   = sentiment,
+        quiz_fitb   = quiz_fitb,
+        quiz_mc     = quiz_mc,
+        readability = readability,
+    )
+
+
+# --------------------------------------------------------------------------
+# 13) BATCH PROCESSING
+# --------------------------------------------------------------------------
+
+def batch_process(
+    urls:           List[str],
+    output_dir:     str  = '.',
+    sentence_count: int  = DEFAULT_SENTENCES,
+    quiz_qs:        int  = DEFAULT_QUIZ_QS,
+    export_format:  str  = 'text',   # 'text' | 'markdown' | 'json'
+    backend:        str  = 'lsa',
+) -> Dict[str, Optional[str]]:
+    """
+    Process multiple YouTube URLs in sequence.
+
+    Args:
+        urls:          List of YouTube URLs to process.
+        output_dir:    Directory to save output files.
+        sentence_count, quiz_qs, export_format, backend: see build_report().
+
+    Returns:
+        Dict mapping each URL to its saved file path (or None on error).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    results: Dict[str, Optional[str]] = {}
+
+    for i, url in enumerate(urls, 1):
+        print_status(f"\n[{i}/{len(urls)}] Processing: {url}", color='green')
+        try:
+            report = build_report(url, sentence_count, quiz_qs, backend=backend)
+            safe_name = re.sub(r'[^\w\-_]', '_', report.title)[:60]
+
+            if export_format == 'json':
+                content = report.to_json()
+                ext     = 'json'
+            elif export_format == 'markdown':
+                content = format_markdown_output(report)
+                ext     = 'md'
+            else:
+                content = format_text_output(report)
+                ext     = 'txt'
+
+            out_path = os.path.join(output_dir, f"{safe_name}.{ext}")
+            safe_write(out_path, content)
+            print_status(f"  ✅ Saved: {out_path}", color='cyan')
+            results[url] = out_path
+
+        except Exception as exc:
+            logger.error("Failed to process %s: %s", url, exc)
+            print_status(f"  ❌ Error: {exc}", color='red')
+            results[url] = None
+
+        # Polite delay between requests
+        if i < len(urls):
+            time.sleep(1.5)
+
+    return results
+
+
+# --------------------------------------------------------------------------
+# 14) STREAMLIT WEB UI
+# --------------------------------------------------------------------------
+
+if st:
+    st.set_page_config(page_title="YouTube Summarizer", page_icon="🎬", layout="wide")
+
+    st.markdown("""
+    <style>
+    :root { --accent: #ff0033; }
+    .stApp {
+        background:
+            radial-gradient(1200px 800px at 10% -20%, #121216 0%, #0c0d12 35%, #0a0a0f 60%),
+            radial-gradient(800px 600px at 110% 10%, rgba(255,0,51,0.15) 0%, rgba(255,0,51,0) 60%),
+            linear-gradient(180deg, #0a0b10 0%, #0a0a0a 100%);
+        color: #e8e8e8;
+    }
+    header[data-testid="stHeader"] { background: transparent; }
+    section.main > div { padding-top: 1rem; }
+    h1,h2,h3,h4,h5,h6 { color: #fff; letter-spacing: .3px; }
+    .stTextArea textarea, .stTextInput input, .stSelectbox > div > div {
+        background: rgba(255,255,255,0.07);
+        color: #f1f1f1;
+        border: 1px solid rgba(255,255,255,0.12);
+    }
+    .stButton > button {
+        background: linear-gradient(135deg, var(--accent) 0%, #ff4d4d 100%);
+        color: #fff; border: 0; border-radius: 8px;
+        padding: .6rem 1rem; font-weight: 600;
+    }
+    code, .stMarkdown pre, .stCodeBlock { background: rgba(0,0,0,0.5); border-radius: 8px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+    def _report_from_json(report_json: str) -> VideoReport:
+        """Rebuild the report dataclass from a saved database JSON payload."""
+        payload = json.loads(report_json)
+        payload["keywords"] = [tuple(item) for item in payload.get("keywords", [])]
+        return VideoReport(**payload)
+
+
+    def _render_report(report: VideoReport, key_prefix: str) -> None:
+        """Show a report and provide a format-specific download."""
+        st.markdown(f"### {report.title}")
+        st.caption(report.url)
+        tab_summary, tab_kw, tab_stats, tab_quiz, tab_raw = st.tabs(
+            ["📘 Summary", "🔎 Keywords", "📊 Stats & Sentiment", "🧠 Quiz", "📄 Export"]
+        )
+        with tab_summary:
+            st.write(report.summary or "*No summary available.*")
+        with tab_kw:
+            if report.keywords:
+                st.table([{"Keyword": word, "Frequency": count} for word, count in report.keywords])
+            else:
+                st.info("No keywords were extracted from these captions.")
+        with tab_stats:
+            st.json({**report.stats, **report.readability, **report.sentiment})
+        with tab_quiz:
+            if report.quiz_fitb:
+                st.subheader("Fill in the blank")
+                for question in report.quiz_fitb:
+                    with st.expander(question["question"]):
+                        st.success(f"Answer: {question['answer']}")
+            if report.quiz_mc:
+                st.subheader("Multiple choice")
+                for question in report.quiz_mc:
+                    with st.expander(question["question"]):
+                        for option in question["options"]:
+                            st.write(option)
+                        st.success(f"Answer: {question['answer']}")
+            if not report.quiz_fitb and not report.quiz_mc:
+                st.info("No quiz questions could be generated from this summary.")
+        with tab_raw:
+            export_format = st.selectbox(
+                "Download format", ["Markdown", "Text", "JSON"], key=f"{key_prefix}_format"
+            )
+            if export_format == "Markdown":
+                content, mime, extension = format_markdown_output(report), "text/markdown", "md"
+            elif export_format == "JSON":
+                content, mime, extension = report.to_json(), "application/json", "json"
+            else:
+                content, mime, extension = format_text_output(report), "text/plain", "txt"
+            safe_title = re.sub(r"[^a-zA-Z0-9_-]+", "_", report.title).strip("_")[:60] or "video_report"
+            st.download_button(
+                "⬇️ Download report", data=content,
+                file_name=f"{safe_title}.{extension}", mime=mime,
+                key=f"{key_prefix}_download",
+            )
+            st.text_area("Report preview", content, height=360, key=f"{key_prefix}_preview")
+
+
+    try:
+        setup_message = db.initialize_database()
+    except Exception:
+        st.error("The local database could not be opened. Check that the app can write to its data folder.")
+        logger.exception("Database initialization failed")
+        st.stop()
+
+    user_id = st.session_state.get("user_id")
+    current_user = db.get_user_by_id(user_id) if user_id else None
+    if not current_user or not current_user["is_active"]:
+        st.session_state.pop("user_id", None)
+        current_user = None
+
+    if current_user is None:
+        st.title("🎬 YouTube Video Summarizer")
+        st.write("Sign in to create summaries and keep your report history in your account.")
+        sign_in_tab, create_tab = st.tabs(["Sign in", "Create account"])
+        with sign_in_tab:
+            with st.form("sign_in_form"):
+                login_username = st.text_input("Username", key="login_username")
+                login_password = st.text_input("Password", type="password", key="login_password")
+                sign_in = st.form_submit_button("Sign in", use_container_width=True)
+            if sign_in:
+                user = db.authenticate(login_username, login_password)
+                if user:
+                    st.session_state["user_id"] = user["id"]
+                    st.rerun()
+                st.error("The username or password is incorrect, or the account is inactive.")
+        with create_tab:
+            with st.form("create_account_form"):
+                new_username = st.text_input("Username", key="new_username", help="3–32 letters, numbers, dots, dashes, or underscores.")
+                new_password = st.text_input("Password", type="password", key="new_password", help="Use at least 12 characters.")
+                confirm_password = st.text_input("Confirm password", type="password", key="confirm_password")
+                create_account = st.form_submit_button("Create account", use_container_width=True)
+            if create_account:
+                if new_password != confirm_password:
+                    st.error("The passwords do not match.")
+                else:
+                    try:
+                        user = db.create_user(new_username, new_password)
+                        st.session_state["user_id"] = user["id"]
+                        st.success("Account created. You are signed in.")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+        if setup_message:
+            st.info(setup_message)
+            st.caption("For local setup, see the README section 'Create the first admin account'.")
+        st.stop()
+
+    if setup_message and current_user["role"] != "admin":
+        st.warning(setup_message)
+
+    with st.sidebar:
+        st.markdown(f"### 👋 {current_user['username']}")
+        st.caption(current_user["role"].capitalize())
+        page_options = ["Summarize", "My history"]
+        if current_user["role"] == "admin":
+            page_options.append("Admin")
+        page = st.radio("Workspace", page_options, label_visibility="collapsed")
+        if st.button("Sign out", use_container_width=True):
+            st.session_state.pop("user_id", None)
+            st.session_state.pop("current_report_json", None)
+            st.rerun()
+
+    if page == "Summarize":
+        st.title("🎬 YouTube Video Summarizer")
+        st.markdown(
+            "Create a summary, keywords, reading statistics, sentiment estimate, and quiz "
+            "from a video's available English captions. Reports are saved to your account."
+        )
+        with st.form(key="url_form"):
+            url_input = st.text_input(
+                "YouTube URL", placeholder="https://www.youtube.com/watch?v=..."
+            )
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                summary_sentences = st.slider(
+                    "Summary sentences", min_value=3, max_value=20,
+                    value=DEFAULT_SENTENCES, step=1,
+                )
+            with col2:
+                quiz_questions = st.slider(
+                    "Quiz questions (each type)", min_value=1, max_value=10,
+                    value=DEFAULT_QUIZ_QS, step=1,
+                )
+            with col3:
+                backend_choice = st.selectbox(
+                    "Summarizer backend", options=SUMMARIZER_BACKENDS, index=0
+                )
+            submit_btn = st.form_submit_button("✨ Generate and save report")
+
+        if submit_btn:
+            if not url_input.strip():
+                st.error("Please enter a YouTube URL.")
+            else:
+                try:
+                    with st.spinner("Reading captions and building your report…"):
+                        report = build_report(
+                            url_input.strip(), sentence_count=summary_sentences,
+                            quiz_qs=quiz_questions, backend=backend_choice,
+                        )
+                        report_id = db.save_report(current_user["id"], report)
+                    st.session_state["current_report_json"] = report.to_json()
+                    st.session_state["current_report_id"] = report_id
+                    st.success("Report generated and saved to My history.")
+                except Exception as exc:
+                    st.error(f"Could not generate the report: {exc}")
+                    logger.exception("Streamlit pipeline error")
+
+        saved_json = st.session_state.get("current_report_json")
+        if saved_json:
+            try:
+                _render_report(_report_from_json(saved_json), "current_report")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                st.warning("The report preview could not be restored. Generate a new report or open My history.")
+
+    elif page == "My history":
+        st.title("📚 My report history")
+        reports = db.list_user_reports(current_user["id"])
+        if not reports:
+            st.info("You have not saved any reports yet. Generate one from the Summarize page.")
+        else:
+            st.caption(f"Showing your latest {len(reports)} saved reports.")
+            report_labels = {
+                f"{row['title']} · {row['created_at'][:16].replace('T', ' ')} · #{row['id']}": row["id"]
+                for row in reports
+            }
+            selected_label = st.selectbox("Choose a report", list(report_labels))
+            selected = db.get_user_report(report_labels[selected_label], current_user["id"])
+            if selected:
+                try:
+                    _render_report(_report_from_json(selected["report_json"]), f"history_{selected['id']}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    st.error("This saved report could not be read. You can create a fresh report from the Summarize page.")
+
+    elif page == "Admin" and current_user["role"] == "admin":
+        st.title("🛡️ Admin dashboard")
+        overview = db.admin_overview()
+        metric1, metric2, metric3, metric4 = st.columns(4)
+        metric1.metric("Accounts", overview["total_users"])
+        metric2.metric("Active accounts", overview["active_users"])
+        metric3.metric("Admins", overview["admins"])
+        metric4.metric("Saved reports", overview["total_reports"])
+
+        st.subheader("Accounts")
+        if overview["users"]:
+            st.dataframe(
+                [{
+                    "Username": user["username"],
+                    "Role": user["role"],
+                    "Status": "Active" if user["is_active"] else "Disabled",
+                    "Saved reports": user["report_count"],
+                    "Created": user["created_at"][:16].replace("T", " "),
+                } for user in overview["users"]],
+                use_container_width=True, hide_index=True,
+            )
+            manageable_users = [user for user in overview["users"] if user["id"] != current_user["id"]]
+            if manageable_users:
+                by_label = {
+                    f"{user['username']} ({user['role']}, {'active' if user['is_active'] else 'disabled'})": user
+                    for user in manageable_users
+                }
+                with st.form("account_status_form"):
+                    selected_account = st.selectbox("Account", list(by_label))
+                    selected_user = by_label[selected_account]
+                    target_active = bool(selected_user["is_active"])
+                    action_label = "Disable account" if target_active else "Reactivate account"
+                    change_status = st.form_submit_button(action_label)
+                if change_status:
+                    try:
+                        db.set_user_active(selected_user["id"], not target_active, current_user["id"])
+                        st.success(f"Updated {selected_user['username']}'s account status.")
+                        st.rerun()
+                    except (PermissionError, ValueError) as exc:
+                        st.error(str(exc))
+        else:
+            st.info("There are no accounts yet.")
+
+        st.subheader("Recent report activity")
+        if overview["recent_reports"]:
+            st.dataframe(
+                [{
+                    "Video": report["title"],
+                    "Account": report["username"],
+                    "Created": report["created_at"][:16].replace("T", " "),
+                } for report in overview["recent_reports"]],
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("No reports have been saved yet.")
+
+
+# --------------------------------------------------------------------------
+# 15) CLI (COMMAND-LINE INTERFACE)
+# --------------------------------------------------------------------------
+
+def main_cli() -> None:
+    """Entry point when the script is run directly from the command line."""
+    parser = argparse.ArgumentParser(
+        description="YouTube Video Summarizer + Quiz Generator (CLI)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""
+        Examples:
+          python summarizer.py --input https://youtu.be/xyz --sentences 10
+          python summarizer.py --input https://youtu.be/xyz --backend luhn --format markdown
+          python summarizer.py --batch urls.txt --output-dir ./reports --format json
+          python summarizer.py --interactive
+        """)
+    )
+    parser.add_argument('--input',      '-i',  help='YouTube video URL',         default=None)
+    parser.add_argument('--output',     '-o',  help='Output file path',          default='summary.txt')
+    parser.add_argument('--sentences',  '-s',  type=int, default=DEFAULT_SENTENCES,
+                        help=f'Summary sentences (default: {DEFAULT_SENTENCES})')
+    parser.add_argument('--quiz',       '-q',  type=int, default=DEFAULT_QUIZ_QS,
+                        help=f'Quiz questions per type (default: {DEFAULT_QUIZ_QS})')
+    parser.add_argument('--keywords',   '-k',  type=int, default=DEFAULT_KEYWORDS,
+                        help=f'Top N keywords (default: {DEFAULT_KEYWORDS})')
+    parser.add_argument('--backend',    '-b',  choices=SUMMARIZER_BACKENDS, default='lsa',
+                        help='Summarizer backend (default: lsa)')
+    parser.add_argument('--format',     '-f',  choices=['text', 'markdown', 'json'], default='text',
+                        help='Output format (default: text)')
+    parser.add_argument('--batch',             help='Path to a text file with one URL per line')
+    parser.add_argument('--output-dir',        help='Output directory for batch mode', default='reports')
+    parser.add_argument('--no-cache',   action='store_true', help='Disable subtitle caching')
+    parser.add_argument('--interactive',action='store_true', help='Interactive prompt mode')
+    parser.add_argument('--verbose',    action='store_true', help='Verbose logging')
+    args = parser.parse_args()
+
+    if args.verbose:
+        _ch.setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+
+    # --- Batch mode ---
+    if args.batch:
+        if not os.path.exists(args.batch):
+            print_status(f"❌ Batch file not found: {args.batch}", color='red')
+            sys.exit(1)
+        with open(args.batch, 'r', encoding='utf-8') as f:
+            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        print_status(f"Batch mode: {len(urls)} URL(s) found.", color='green')
+        batch_process(
+            urls,
+            output_dir    = args.output_dir,
+            sentence_count= args.sentences,
+            quiz_qs       = args.quiz,
+            export_format = args.format,
+            backend       = args.backend,
+        )
+        return
+
+    # --- Interactive mode ---
+    if args.interactive or not args.input:
+        try:
+            print_status("YouTube Summarizer — Interactive Mode", color='green')
+            url       = input("Enter YouTube URL: ").strip()
+            out_path  = input(f"Output file [default: {args.output}]: ").strip() or args.output
+            sentences = int(input(f"Summary sentences [default {DEFAULT_SENTENCES}]: ").strip() or DEFAULT_SENTENCES)
+            quiz_qs   = int(input(f"Quiz questions    [default {DEFAULT_QUIZ_QS}]: ").strip() or DEFAULT_QUIZ_QS)
+            backend   = input(f"Backend {SUMMARIZER_BACKENDS} [default lsa]: ").strip() or 'lsa'
+            fmt       = input("Format (text/markdown/json) [default text]: ").strip() or 'text'
+        except (KeyboardInterrupt, EOFError):
+            print('\nExiting.')
+            sys.exit(0)
+    else:
+        url, out_path, sentences, quiz_qs = args.input, args.output, args.sentences, args.quiz
+        backend, fmt = args.backend, args.format
+
+    # --- Single URL mode ---
+    try:
+        print_status(f"\n🔍 Analyzing: {url}", color='green')
+        rpt = build_report(
+            url,
+            sentence_count = sentences,
+            quiz_qs        = quiz_qs,
+            top_keywords   = args.keywords,
+            backend        = backend,
+            use_cache      = not args.no_cache,
+        )
+
+        if fmt == 'json':
+            content = rpt.to_json()
+        elif fmt == 'markdown':
+            content = format_markdown_output(rpt)
+        else:
+            content = format_text_output(rpt)
+
+        safe_write(out_path, content)
+        print_status(f"\n✅  Report saved to: {out_path}", color='cyan')
+        print("\n" + content)
+
+    except Exception as exc:
+        logger.exception("CLI execution failed")
+        print_status(f"❌ Error: {exc}", color='red')
+        sys.exit(1)
+
+
+# --------------------------------------------------------------------------
+# ENTRY POINT
+# --------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    main_cli()
