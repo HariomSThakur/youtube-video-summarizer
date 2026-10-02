@@ -1,0 +1,7 @@
+yt-dlp
+nltk
+sumy
+textblob
+colorama
+tqdm
+streamlit
